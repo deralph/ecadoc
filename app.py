@@ -12,6 +12,9 @@ from modules.config import settings
 from modules.auth import auth_router
 from modules.pdf_processing import pdf_router
 from modules.projects import project_router
+from modules.admin import admin_router
+from modules.billing import billing_router
+from modules.profile import profile_router
 from modules.api import agent_router, general_router
 from modules.api.session_endpoints import router as session_router
 def create_app() -> FastAPI:
@@ -43,6 +46,9 @@ def create_app() -> FastAPI:
     app.include_router(project_router)  # Project management endpoints
     app.include_router(agent_router)    # Agent workflow endpoints
     app.include_router(session_router)  # Session management endpoints
+    app.include_router(admin_router)    # Admin endpoints
+    app.include_router(billing_router)  # Billing endpoints
+    app.include_router(profile_router)  # Profile endpoints
     
     return app
 

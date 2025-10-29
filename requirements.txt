@@ -41,3 +41,7 @@ inference-sdk
 
 # Other utilities
 requests
+
+# Payments and storage
+stripe
+boto3

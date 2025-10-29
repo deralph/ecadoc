@@ -57,3 +57,49 @@ modules/
 - **Maintainability**: Easy to update individual components
 - **Testability**: Each module can be tested independently
 - **Scalability**: Easy to add new features or modify existing ones
+
+## New Capabilities
+
+### Shared Project Workflows
+- `GET /projects/shared` returns invitations and accepted shares for the authenticated user.
+- `POST /projects/{project_id}/share/accept` and `/reject` let invitees control access while the backend tracks membership status.
+
+### Subscription & Billing Platform
+- Stripe-backed checkout limited to six-month and annual plans via `/billing/checkout`.
+- `/billing/subscription` exposes the user’s current status so the frontend can gate premium features.
+- Admin dashboard data is restored through `/admin/metrics/overview`, delivering totals and chart-ready timeseries.
+
+### Durable Profile Avatars
+- `/profile/avatar` stores uploads in S3 (or local fallback) with cache-busted URLs, preventing disappearing profile photos.
+
+## Deployment & Operations
+
+### 1. Run the subscription migration
+```
+python migrations/20240201_subscription_pricing.py
+```
+
+### 2. Create Stripe prices
+Create one 6-month and one annual price in Stripe, then export their IDs to the API environment:
+```
+export STRIPE_API_KEY=sk_live_...
+export STRIPE_WEBHOOK_SECRET=whsec_...
+export STRIPE_PRICE_6M=price_...
+export STRIPE_PRICE_12M=price_...
+```
+
+### 3. Configure profile storage
+For S3-backed avatars set:
+```
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_DEFAULT_REGION=us-east-1
+export AWS_S3_BUCKET=my-profile-bucket
+export PROFILE_CDN_BASE_URL=https://cdn.example.com
+```
+The service falls back to local storage when the bucket or credentials are omitted.
+
+### 4. Run tests
+```
+pytest
+```

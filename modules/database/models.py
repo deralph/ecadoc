@@ -13,7 +13,7 @@ import json
 import uuid
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from modules.config.settings import settings
 
 @dataclass
@@ -94,6 +94,63 @@ class Project:
     doc_ids: Optional[List[str]] = None  # Associated document IDs as list
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+
+@dataclass
+class ProjectShare:
+    """Project sharing invitation"""
+    id: Optional[int] = None
+    project_id: str = ""
+    inviter_user_id: int = 0
+    invitee_user_id: int = 0
+    status: str = "pending"  # pending, accepted, rejected
+    invitation_token: Optional[str] = None
+    created_at: Optional[datetime] = None
+    responded_at: Optional[datetime] = None
+
+
+@dataclass
+class SubscriptionPlan:
+    """Subscription plan definition"""
+    id: Optional[int] = None
+    plan_code: str = ""
+    name: str = ""
+    interval_months: int = 0
+    amount_cents: int = 0
+    stripe_price_id: Optional[str] = None
+    is_active: bool = True
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+@dataclass
+class UserSubscription:
+    """Active subscription for a user"""
+    id: Optional[int] = None
+    user_id: int = 0
+    plan_code: str = ""
+    stripe_subscription_id: Optional[str] = None
+    stripe_customer_id: Optional[str] = None
+    status: str = "inactive"
+    current_period_start: Optional[datetime] = None
+    current_period_end: Optional[datetime] = None
+    cancel_at_period_end: bool = False
+    cancellation_effective_date: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+@dataclass
+class UserProfilePhoto:
+    """Stored reference to a user's profile photo"""
+    id: Optional[int] = None
+    user_id: int = 0
+    object_key: str = ""
+    url: Optional[str] = None
+    storage_backend: str = "s3"
+    etag: Optional[str] = None
+    last_updated: Optional[datetime] = None
+
 
 @dataclass
 class ChatSession:
@@ -451,11 +508,92 @@ class DatabaseManager:
                     UNIQUE (project_id, doc_id)
                 )
             """)
-            
+
             # Create indexes for project_documents
             cur.execute("CREATE INDEX IF NOT EXISTS idx_project_documents_project_id ON project_documents (project_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_project_documents_doc_id ON project_documents (doc_id)")
-            
+
+            # Create project_shares table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS project_shares(
+                    id SERIAL PRIMARY KEY,
+                    project_id VARCHAR(255) NOT NULL,
+                    inviter_user_id INTEGER NOT NULL,
+                    invitee_user_id INTEGER NOT NULL,
+                    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                    invitation_token VARCHAR(255),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    responded_at TIMESTAMP NULL,
+                    UNIQUE(project_id, invitee_user_id),
+                    FOREIGN KEY (project_id) REFERENCES projects (project_id) ON DELETE CASCADE,
+                    FOREIGN KEY (inviter_user_id) REFERENCES userdata (id) ON DELETE CASCADE,
+                    FOREIGN KEY (invitee_user_id) REFERENCES userdata (id) ON DELETE CASCADE
+                )
+            """)
+
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_project_shares_invitee ON project_shares (invitee_user_id, status)")
+
+            # Create subscription tables
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS subscription_plans(
+                    id SERIAL PRIMARY KEY,
+                    plan_code VARCHAR(50) UNIQUE NOT NULL,
+                    name VARCHAR(255) NOT NULL,
+                    interval_months INTEGER NOT NULL,
+                    amount_cents INTEGER NOT NULL,
+                    stripe_price_id VARCHAR(255),
+                    is_active BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_subscriptions(
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    plan_code VARCHAR(50) NOT NULL,
+                    stripe_subscription_id VARCHAR(255),
+                    stripe_customer_id VARCHAR(255),
+                    status VARCHAR(30) NOT NULL DEFAULT 'inactive',
+                    current_period_start TIMESTAMP NULL,
+                    current_period_end TIMESTAMP NULL,
+                    cancel_at_period_end BOOLEAN DEFAULT FALSE,
+                    cancellation_effective_date TIMESTAMP NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id),
+                    FOREIGN KEY (plan_code) REFERENCES subscription_plans (plan_code),
+                    FOREIGN KEY (user_id) REFERENCES userdata (id) ON DELETE CASCADE
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS subscription_events(
+                    id SERIAL PRIMARY KEY,
+                    event_type VARCHAR(100) NOT NULL,
+                    stripe_event_id VARCHAR(255),
+                    payload JSONB,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_subscription_events_type ON subscription_events (event_type)")
+
+            # Create user profile photo table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_profile_photos(
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL UNIQUE,
+                    object_key VARCHAR(500) NOT NULL,
+                    url VARCHAR(500),
+                    storage_backend VARCHAR(50) NOT NULL,
+                    etag VARCHAR(255),
+                    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES userdata (id) ON DELETE CASCADE
+                )
+            """)
+
             # Create chat_sessions table
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS chat_sessions(
@@ -477,9 +615,9 @@ class DatabaseManager:
             cur.execute("CREATE INDEX IF NOT EXISTS idx_chat_sessions_session_id ON chat_sessions (session_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_chat_sessions_last_activity ON chat_sessions (last_activity)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_chat_sessions_active ON chat_sessions (user_id, is_active)")
-            
+
             conn.commit()
-            
+
             # Create new tables for file and vector storage
             self.create_new_tables()
             
@@ -709,7 +847,87 @@ class DatabaseManager:
             # Create indexes for project_documents table
             cur.execute("CREATE INDEX IF NOT EXISTS idx_project_documents_project_id ON project_documents (project_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_project_documents_doc_id ON project_documents (doc_id)")
-            
+
+            # Create project_shares table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS project_shares(
+                    id INTEGER PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    inviter_user_id INTEGER NOT NULL,
+                    invitee_user_id INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    invitation_token TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    responded_at DATETIME,
+                    UNIQUE(project_id, invitee_user_id),
+                    FOREIGN KEY (project_id) REFERENCES projects (project_id) ON DELETE CASCADE,
+                    FOREIGN KEY (inviter_user_id) REFERENCES userdata (id) ON DELETE CASCADE,
+                    FOREIGN KEY (invitee_user_id) REFERENCES userdata (id) ON DELETE CASCADE
+                )
+            """)
+
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_project_shares_invitee ON project_shares (invitee_user_id, status)")
+
+            # Create subscription tables
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS subscription_plans(
+                    id INTEGER PRIMARY KEY,
+                    plan_code TEXT UNIQUE NOT NULL,
+                    name TEXT NOT NULL,
+                    interval_months INTEGER NOT NULL,
+                    amount_cents INTEGER NOT NULL,
+                    stripe_price_id TEXT,
+                    is_active BOOLEAN DEFAULT 1,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_subscriptions(
+                    id INTEGER PRIMARY KEY,
+                    user_id INTEGER NOT NULL UNIQUE,
+                    plan_code TEXT NOT NULL,
+                    stripe_subscription_id TEXT,
+                    stripe_customer_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'inactive',
+                    current_period_start DATETIME,
+                    current_period_end DATETIME,
+                    cancel_at_period_end BOOLEAN DEFAULT 0,
+                    cancellation_effective_date DATETIME,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (plan_code) REFERENCES subscription_plans (plan_code),
+                    FOREIGN KEY (user_id) REFERENCES userdata (id) ON DELETE CASCADE
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS subscription_events(
+                    id INTEGER PRIMARY KEY,
+                    event_type TEXT NOT NULL,
+                    stripe_event_id TEXT,
+                    payload TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_subscription_events_type ON subscription_events (event_type)")
+
+            # Create user profile photo table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_profile_photos(
+                    id INTEGER PRIMARY KEY,
+                    user_id INTEGER NOT NULL UNIQUE,
+                    object_key TEXT NOT NULL,
+                    url TEXT,
+                    storage_backend TEXT NOT NULL,
+                    etag TEXT,
+                    last_updated DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES userdata (id) ON DELETE CASCADE
+                )
+            """)
+
             # Create chat_sessions table for enhanced session management
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS chat_sessions(
@@ -741,6 +959,12 @@ class DatabaseManager:
                     ("Test", "User", "test@example.com", test_password)
                 )
         
+        # Ensure subscription plans exist after schema setup
+        try:
+            self.ensure_default_subscription_plans()
+        except Exception as seed_error:
+            print(f"WARNING: Failed to seed subscription plans: {seed_error}")
+
         conn.commit()
         conn.close()
         
@@ -837,7 +1061,46 @@ class DatabaseManager:
         if self.use_rds:
             return "%s" if not self.is_postgres else "%s"
         return "?"
-    
+
+    def _to_datetime(self, value: Any) -> Optional[datetime]:
+        """Best-effort conversion to datetime"""
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, (int, float)):
+            try:
+                return datetime.utcfromtimestamp(value)
+            except Exception:
+                return None
+        if isinstance(value, str):
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z"):
+                try:
+                    dt = datetime.strptime(value, fmt)
+                    if not dt.tzinfo:
+                        return dt
+                    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+                except Exception:
+                    continue
+            try:
+                return datetime.fromisoformat(value.replace('Z', '+00:00'))
+            except Exception:
+                return None
+        return None
+
+    def _row_get(self, row: Any, key: str, index: int):
+        """Compatibility helper for dictionary/tuple rows"""
+        if isinstance(row, dict):
+            return row.get(key)
+        return row[index]
+
+    def _format_datetime(self, value: Optional[datetime]) -> Optional[str]:
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            return value.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+        return value
+
     def ensure_pgvector_extension(self) -> bool:
         """Ensure pgvector extension is available in PostgreSQL"""
         if not self.is_postgres:
@@ -2066,10 +2329,793 @@ class DatabaseManager:
                 ))
             
             return result
-            
+
         finally:
             conn.close()
-    
+
+    def get_project_share(self, project_id: str, invitee_user_id: int) -> Optional[ProjectShare]:
+        """Retrieve a project share invitation"""
+        conn = self.get_connection()
+        cur = conn.cursor()
+        placeholder = self._get_placeholder()
+
+        try:
+            cur.execute(
+                f"SELECT id, project_id, inviter_user_id, invitee_user_id, status, invitation_token, created_at, responded_at "
+                f"FROM project_shares WHERE project_id = {placeholder} AND invitee_user_id = {placeholder}",
+                (project_id, invitee_user_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+
+            return ProjectShare(
+                id=self._row_get(row, 'id', 0),
+                project_id=self._row_get(row, 'project_id', 1),
+                inviter_user_id=self._row_get(row, 'inviter_user_id', 2),
+                invitee_user_id=self._row_get(row, 'invitee_user_id', 3),
+                status=self._row_get(row, 'status', 4),
+                invitation_token=self._row_get(row, 'invitation_token', 5),
+                created_at=self._to_datetime(self._row_get(row, 'created_at', 6)),
+                responded_at=self._to_datetime(self._row_get(row, 'responded_at', 7)),
+            )
+        finally:
+            conn.close()
+
+    def create_or_update_project_share(
+        self,
+        project_id: str,
+        inviter_user_id: int,
+        invitee_user_id: int,
+        status: str = 'pending',
+        invitation_token: str = None,
+    ) -> ProjectShare:
+        """Create a new share or update an existing pending invite"""
+        existing = self.get_project_share(project_id, invitee_user_id)
+        conn = self.get_connection()
+        cur = conn.cursor()
+        placeholder = self._get_placeholder()
+
+        try:
+            if existing:
+                cur.execute(
+                    f"""
+                        UPDATE project_shares
+                        SET inviter_user_id = {placeholder},
+                            status = {placeholder},
+                            invitation_token = {placeholder},
+                            created_at = CURRENT_TIMESTAMP,
+                            responded_at = NULL
+                        WHERE project_id = {placeholder} AND invitee_user_id = {placeholder}
+                    """,
+                    (inviter_user_id, status, invitation_token, project_id, invitee_user_id),
+                )
+            else:
+                cur.execute(
+                    f"INSERT INTO project_shares (project_id, inviter_user_id, invitee_user_id, status, invitation_token)"
+                    f" VALUES ({placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder})",
+                    (project_id, inviter_user_id, invitee_user_id, status, invitation_token),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        return self.get_project_share(project_id, invitee_user_id)
+
+    def update_project_share_status(
+        self,
+        project_id: str,
+        invitee_user_id: int,
+        status: str,
+    ) -> Optional[ProjectShare]:
+        """Update a share status and set responded_at"""
+        conn = self.get_connection()
+        cur = conn.cursor()
+        placeholder = self._get_placeholder()
+
+        try:
+            cur.execute(
+                f"""
+                    UPDATE project_shares
+                    SET status = {placeholder},
+                        responded_at = CURRENT_TIMESTAMP
+                    WHERE project_id = {placeholder} AND invitee_user_id = {placeholder}
+                """,
+                (status, project_id, invitee_user_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        return self.get_project_share(project_id, invitee_user_id)
+
+    def list_shared_projects_for_user(self, user_id: int) -> List[Dict[str, Any]]:
+        """List projects shared with a user"""
+        conn = self.get_connection()
+        cur = conn.cursor()
+        placeholder = self._get_placeholder()
+
+        try:
+            cur.execute(
+                f"""
+                    SELECT ps.id, ps.project_id, ps.inviter_user_id, ps.invitee_user_id, ps.status, ps.invitation_token,
+                           ps.created_at, ps.responded_at,
+                           p.name, p.description, p.user_id AS owner_user_id, p.created_at AS project_created_at,
+                           p.updated_at AS project_updated_at
+                    FROM project_shares ps
+                    INNER JOIN projects p ON p.project_id = ps.project_id
+                    WHERE ps.invitee_user_id = {placeholder}
+                    ORDER BY ps.created_at DESC
+                """,
+                (user_id,),
+            )
+            rows = cur.fetchall()
+            result = []
+            for row in rows:
+                result.append({
+                    "share_id": self._row_get(row, 'id', 0),
+                    "project_id": self._row_get(row, 'project_id', 1),
+                    "inviter_user_id": self._row_get(row, 'inviter_user_id', 2),
+                    "invitee_user_id": self._row_get(row, 'invitee_user_id', 3),
+                    "status": self._row_get(row, 'status', 4),
+                    "invitation_token": self._row_get(row, 'invitation_token', 5),
+                    "created_at": self._to_datetime(self._row_get(row, 'created_at', 6)),
+                    "responded_at": self._to_datetime(self._row_get(row, 'responded_at', 7)),
+                    "project": {
+                        "name": self._row_get(row, 'name', 8),
+                        "description": self._row_get(row, 'description', 9),
+                        "owner_user_id": self._row_get(row, 'owner_user_id', 10),
+                        "created_at": self._to_datetime(self._row_get(row, 'project_created_at', 11)),
+                        "updated_at": self._to_datetime(self._row_get(row, 'project_updated_at', 12)),
+                    },
+                })
+            return result
+        finally:
+            conn.close()
+
+    def user_has_project_access(self, project_id: str, user_id: int) -> bool:
+        """Check if user is owner or accepted share"""
+        # Ownership check
+        project = self.get_project_by_id(project_id)
+        if project and project.user_id == user_id:
+            return True
+
+        share = self.get_project_share(project_id, user_id)
+        return bool(share and share.status == 'accepted')
+
+    # Subscription management
+    def upsert_subscription_plan(
+        self,
+        plan_code: str,
+        name: str,
+        interval_months: int,
+        amount_cents: int,
+        stripe_price_id: str = None,
+        is_active: bool = True,
+    ) -> SubscriptionPlan:
+        """Create or update a subscription plan"""
+        conn = self.get_connection()
+        cur = conn.cursor()
+
+        params = (plan_code, name, interval_months, amount_cents, stripe_price_id, is_active)
+
+        try:
+            if self.use_rds:
+                if self.is_postgres:
+                    cur.execute(
+                        """
+                            INSERT INTO subscription_plans (plan_code, name, interval_months, amount_cents, stripe_price_id, is_active)
+                            VALUES (%s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (plan_code) DO UPDATE SET
+                                name = EXCLUDED.name,
+                                interval_months = EXCLUDED.interval_months,
+                                amount_cents = EXCLUDED.amount_cents,
+                                stripe_price_id = EXCLUDED.stripe_price_id,
+                                is_active = EXCLUDED.is_active,
+                                updated_at = CURRENT_TIMESTAMP
+                        """,
+                        params,
+                    )
+                else:
+                    cur.execute(
+                        """
+                            INSERT INTO subscription_plans (plan_code, name, interval_months, amount_cents, stripe_price_id, is_active)
+                            VALUES (%s, %s, %s, %s, %s, %s)
+                            ON DUPLICATE KEY UPDATE
+                                name = VALUES(name),
+                                interval_months = VALUES(interval_months),
+                                amount_cents = VALUES(amount_cents),
+                                stripe_price_id = VALUES(stripe_price_id),
+                                is_active = VALUES(is_active),
+                                updated_at = CURRENT_TIMESTAMP
+                        """,
+                        params,
+                    )
+            else:
+                cur.execute(
+                    """
+                        INSERT INTO subscription_plans (plan_code, name, interval_months, amount_cents, stripe_price_id, is_active)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(plan_code) DO UPDATE SET
+                            name = excluded.name,
+                            interval_months = excluded.interval_months,
+                            amount_cents = excluded.amount_cents,
+                            stripe_price_id = excluded.stripe_price_id,
+                            is_active = excluded.is_active,
+                            updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (plan_code, name, interval_months, amount_cents, stripe_price_id, int(is_active)),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        return self.get_subscription_plan(plan_code)
+
+    def get_subscription_plan(self, plan_code: str) -> Optional[SubscriptionPlan]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        placeholder = self._get_placeholder()
+
+        try:
+            cur.execute(
+                f"SELECT id, plan_code, name, interval_months, amount_cents, stripe_price_id, is_active, created_at, updated_at "
+                f"FROM subscription_plans WHERE plan_code = {placeholder}",
+                (plan_code,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+
+            return SubscriptionPlan(
+                id=self._row_get(row, 'id', 0),
+                plan_code=self._row_get(row, 'plan_code', 1),
+                name=self._row_get(row, 'name', 2),
+                interval_months=self._row_get(row, 'interval_months', 3),
+                amount_cents=self._row_get(row, 'amount_cents', 4),
+                stripe_price_id=self._row_get(row, 'stripe_price_id', 5),
+                is_active=bool(self._row_get(row, 'is_active', 6)),
+                created_at=self._to_datetime(self._row_get(row, 'created_at', 7)),
+                updated_at=self._to_datetime(self._row_get(row, 'updated_at', 8)),
+            )
+        finally:
+            conn.close()
+
+    def get_active_subscription_plans(self) -> List[SubscriptionPlan]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+
+        try:
+            cur.execute(
+                "SELECT id, plan_code, name, interval_months, amount_cents, stripe_price_id, is_active, created_at, updated_at "
+                "FROM subscription_plans WHERE is_active = 1 OR is_active = TRUE ORDER BY interval_months"
+            )
+            rows = cur.fetchall()
+            plans = []
+            for row in rows:
+                plans.append(
+                    SubscriptionPlan(
+                        id=self._row_get(row, 'id', 0),
+                        plan_code=self._row_get(row, 'plan_code', 1),
+                        name=self._row_get(row, 'name', 2),
+                        interval_months=self._row_get(row, 'interval_months', 3),
+                        amount_cents=self._row_get(row, 'amount_cents', 4),
+                        stripe_price_id=self._row_get(row, 'stripe_price_id', 5),
+                        is_active=bool(self._row_get(row, 'is_active', 6)),
+                        created_at=self._to_datetime(self._row_get(row, 'created_at', 7)),
+                        updated_at=self._to_datetime(self._row_get(row, 'updated_at', 8)),
+                    )
+                )
+            return plans
+        finally:
+            conn.close()
+
+    def create_or_update_user_subscription(
+        self,
+        user_id: int,
+        plan_code: str,
+        stripe_subscription_id: str,
+        stripe_customer_id: str,
+        status: str,
+        current_period_start: datetime = None,
+        current_period_end: datetime = None,
+        cancel_at_period_end: bool = False,
+        cancellation_effective_date: datetime = None,
+    ) -> UserSubscription:
+        conn = self.get_connection()
+        cur = conn.cursor()
+
+        params = (
+            user_id,
+            plan_code,
+            stripe_subscription_id,
+            stripe_customer_id,
+            status,
+            self._format_datetime(current_period_start),
+            self._format_datetime(current_period_end),
+            cancel_at_period_end,
+            self._format_datetime(cancellation_effective_date),
+        )
+
+        try:
+            if self.use_rds:
+                if self.is_postgres:
+                    cur.execute(
+                        """
+                            INSERT INTO user_subscriptions (user_id, plan_code, stripe_subscription_id, stripe_customer_id, status,
+                                current_period_start, current_period_end, cancel_at_period_end, cancellation_effective_date)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (user_id) DO UPDATE SET
+                                plan_code = EXCLUDED.plan_code,
+                                stripe_subscription_id = EXCLUDED.stripe_subscription_id,
+                                stripe_customer_id = EXCLUDED.stripe_customer_id,
+                                status = EXCLUDED.status,
+                                current_period_start = EXCLUDED.current_period_start,
+                                current_period_end = EXCLUDED.current_period_end,
+                                cancel_at_period_end = EXCLUDED.cancel_at_period_end,
+                                cancellation_effective_date = EXCLUDED.cancellation_effective_date,
+                                updated_at = CURRENT_TIMESTAMP
+                        """,
+                        params,
+                    )
+                else:
+                    cur.execute(
+                        """
+                            INSERT INTO user_subscriptions (user_id, plan_code, stripe_subscription_id, stripe_customer_id, status,
+                                current_period_start, current_period_end, cancel_at_period_end, cancellation_effective_date)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON DUPLICATE KEY UPDATE
+                                plan_code = VALUES(plan_code),
+                                stripe_subscription_id = VALUES(stripe_subscription_id),
+                                stripe_customer_id = VALUES(stripe_customer_id),
+                                status = VALUES(status),
+                                current_period_start = VALUES(current_period_start),
+                                current_period_end = VALUES(current_period_end),
+                                cancel_at_period_end = VALUES(cancel_at_period_end),
+                                cancellation_effective_date = VALUES(cancellation_effective_date),
+                                updated_at = CURRENT_TIMESTAMP
+                        """,
+                        params,
+                    )
+            else:
+                cur.execute(
+                    """
+                        INSERT INTO user_subscriptions (user_id, plan_code, stripe_subscription_id, stripe_customer_id, status,
+                            current_period_start, current_period_end, cancel_at_period_end, cancellation_effective_date)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(user_id) DO UPDATE SET
+                            plan_code = excluded.plan_code,
+                            stripe_subscription_id = excluded.stripe_subscription_id,
+                            stripe_customer_id = excluded.stripe_customer_id,
+                            status = excluded.status,
+                            current_period_start = excluded.current_period_start,
+                            current_period_end = excluded.current_period_end,
+                            cancel_at_period_end = excluded.cancel_at_period_end,
+                            cancellation_effective_date = excluded.cancellation_effective_date,
+                            updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        user_id,
+                        plan_code,
+                        stripe_subscription_id,
+                        stripe_customer_id,
+                        status,
+                        self._format_datetime(current_period_start),
+                        self._format_datetime(current_period_end),
+                        int(cancel_at_period_end),
+                        self._format_datetime(cancellation_effective_date),
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        return self.get_user_subscription_by_user(user_id)
+
+    def update_subscription_status(
+        self,
+        stripe_subscription_id: str,
+        status: str,
+        current_period_start: datetime = None,
+        current_period_end: datetime = None,
+        cancel_at_period_end: bool = None,
+        cancellation_effective_date: datetime = None,
+    ) -> Optional[UserSubscription]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        placeholder = self._get_placeholder()
+
+        updates = ["status = {placeholder}".format(placeholder=placeholder)]
+        params: List[Any] = [status]
+
+        if current_period_start is not None:
+            updates.append(f"current_period_start = {placeholder}")
+            params.append(self._format_datetime(current_period_start))
+        if current_period_end is not None:
+            updates.append(f"current_period_end = {placeholder}")
+            params.append(self._format_datetime(current_period_end))
+        if cancel_at_period_end is not None:
+            updates.append(f"cancel_at_period_end = {placeholder}")
+            params.append(cancel_at_period_end if self.use_rds else int(cancel_at_period_end))
+        if cancellation_effective_date is not None:
+            updates.append(f"cancellation_effective_date = {placeholder}")
+            params.append(self._format_datetime(cancellation_effective_date))
+
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+
+        set_clause = ", ".join(updates)
+
+        params.append(stripe_subscription_id)
+
+        try:
+            cur.execute(
+                f"UPDATE user_subscriptions SET {set_clause} WHERE stripe_subscription_id = {placeholder}",
+                tuple(params),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        return self.get_subscription_by_stripe_id(stripe_subscription_id)
+
+    def get_user_subscription_by_user(self, user_id: int) -> Optional[UserSubscription]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        placeholder = self._get_placeholder()
+
+        try:
+            cur.execute(
+                f"SELECT id, user_id, plan_code, stripe_subscription_id, stripe_customer_id, status, current_period_start, "
+                f"current_period_end, cancel_at_period_end, cancellation_effective_date, created_at, updated_at "
+                f"FROM user_subscriptions WHERE user_id = {placeholder}",
+                (user_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+
+            return UserSubscription(
+                id=self._row_get(row, 'id', 0),
+                user_id=self._row_get(row, 'user_id', 1),
+                plan_code=self._row_get(row, 'plan_code', 2),
+                stripe_subscription_id=self._row_get(row, 'stripe_subscription_id', 3),
+                stripe_customer_id=self._row_get(row, 'stripe_customer_id', 4),
+                status=self._row_get(row, 'status', 5),
+                current_period_start=self._to_datetime(self._row_get(row, 'current_period_start', 6)),
+                current_period_end=self._to_datetime(self._row_get(row, 'current_period_end', 7)),
+                cancel_at_period_end=bool(self._row_get(row, 'cancel_at_period_end', 8)),
+                cancellation_effective_date=self._to_datetime(self._row_get(row, 'cancellation_effective_date', 9)),
+                created_at=self._to_datetime(self._row_get(row, 'created_at', 10)),
+                updated_at=self._to_datetime(self._row_get(row, 'updated_at', 11)),
+            )
+        finally:
+            conn.close()
+
+    def get_subscription_by_stripe_id(self, stripe_subscription_id: str) -> Optional[UserSubscription]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        placeholder = self._get_placeholder()
+
+        try:
+            cur.execute(
+                f"SELECT id, user_id, plan_code, stripe_subscription_id, stripe_customer_id, status, current_period_start, "
+                f"current_period_end, cancel_at_period_end, cancellation_effective_date, created_at, updated_at "
+                f"FROM user_subscriptions WHERE stripe_subscription_id = {placeholder}",
+                (stripe_subscription_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+
+            return UserSubscription(
+                id=self._row_get(row, 'id', 0),
+                user_id=self._row_get(row, 'user_id', 1),
+                plan_code=self._row_get(row, 'plan_code', 2),
+                stripe_subscription_id=self._row_get(row, 'stripe_subscription_id', 3),
+                stripe_customer_id=self._row_get(row, 'stripe_customer_id', 4),
+                status=self._row_get(row, 'status', 5),
+                current_period_start=self._to_datetime(self._row_get(row, 'current_period_start', 6)),
+                current_period_end=self._to_datetime(self._row_get(row, 'current_period_end', 7)),
+                cancel_at_period_end=bool(self._row_get(row, 'cancel_at_period_end', 8)),
+                cancellation_effective_date=self._to_datetime(self._row_get(row, 'cancellation_effective_date', 9)),
+                created_at=self._to_datetime(self._row_get(row, 'created_at', 10)),
+                updated_at=self._to_datetime(self._row_get(row, 'updated_at', 11)),
+            )
+        finally:
+            conn.close()
+
+    def record_subscription_event(self, event_type: str, payload: Dict[str, Any], stripe_event_id: str = None):
+        conn = self.get_connection()
+        cur = conn.cursor()
+        placeholder = self._get_placeholder()
+
+        payload_json = json.dumps(payload)
+
+        try:
+            cur.execute(
+                f"INSERT INTO subscription_events (event_type, stripe_event_id, payload) VALUES ({placeholder}, {placeholder}, {placeholder})",
+                (event_type, stripe_event_id, payload_json),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def ensure_default_subscription_plans(self):
+        """Ensure the canonical semi-annual and annual plans exist"""
+        defaults = [
+            (
+                'plan_semiannual',
+                'Semi-Annual Plan',
+                6,
+                0,
+                settings.STRIPE_PRICE_6M,
+            ),
+            (
+                'plan_annual',
+                'Annual Plan',
+                12,
+                0,
+                settings.STRIPE_PRICE_12M,
+            ),
+        ]
+
+        for plan_code, name, months, amount_cents, price_id in defaults:
+            # Only seed plan if stripe price id is provided or plan already exists
+            existing = self.get_subscription_plan(plan_code)
+            if price_id or existing:
+                self.upsert_subscription_plan(
+                    plan_code,
+                    name,
+                    months,
+                    amount_cents if amount_cents else (existing.amount_cents if existing else 0),
+                    price_id or (existing.stripe_price_id if existing else None),
+                    True,
+                )
+
+    def list_subscription_events_since(self, since: datetime) -> List[Dict[str, Any]]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        placeholder = self._get_placeholder()
+
+        try:
+            cur.execute(
+                f"SELECT id, event_type, stripe_event_id, payload, created_at FROM subscription_events WHERE created_at >= {placeholder}",
+                (self._format_datetime(since),),
+            )
+            rows = cur.fetchall()
+            events = []
+            for row in rows:
+                payload_raw = self._row_get(row, 'payload', 3)
+                try:
+                    payload_json = json.loads(payload_raw) if isinstance(payload_raw, (str, bytes)) else payload_raw
+                except Exception:
+                    payload_json = payload_raw
+                events.append({
+                    'id': self._row_get(row, 'id', 0),
+                    'event_type': self._row_get(row, 'event_type', 1),
+                    'stripe_event_id': self._row_get(row, 'stripe_event_id', 2),
+                    'payload': payload_json,
+                    'created_at': self._to_datetime(self._row_get(row, 'created_at', 4)),
+                })
+            return events
+        finally:
+            conn.close()
+
+    def list_user_subscriptions(self, since: datetime = None) -> List[UserSubscription]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+
+        try:
+            if since:
+                cur.execute(
+                    "SELECT id, user_id, plan_code, stripe_subscription_id, stripe_customer_id, status, current_period_start, "
+                    "current_period_end, cancel_at_period_end, cancellation_effective_date, created_at, updated_at "
+                    "FROM user_subscriptions WHERE created_at >= ?" if not self.use_rds else
+                    "SELECT id, user_id, plan_code, stripe_subscription_id, stripe_customer_id, status, current_period_start, "
+                    "current_period_end, cancel_at_period_end, cancellation_effective_date, created_at, updated_at FROM user_subscriptions WHERE created_at >= %s",
+                    (self._format_datetime(since),),
+                )
+            else:
+                cur.execute(
+                    "SELECT id, user_id, plan_code, stripe_subscription_id, stripe_customer_id, status, current_period_start, "
+                    "current_period_end, cancel_at_period_end, cancellation_effective_date, created_at, updated_at FROM user_subscriptions"
+                )
+            rows = cur.fetchall()
+            subs = []
+            for row in rows:
+                subs.append(
+                    UserSubscription(
+                        id=self._row_get(row, 'id', 0),
+                        user_id=self._row_get(row, 'user_id', 1),
+                        plan_code=self._row_get(row, 'plan_code', 2),
+                        stripe_subscription_id=self._row_get(row, 'stripe_subscription_id', 3),
+                        stripe_customer_id=self._row_get(row, 'stripe_customer_id', 4),
+                        status=self._row_get(row, 'status', 5),
+                        current_period_start=self._to_datetime(self._row_get(row, 'current_period_start', 6)),
+                        current_period_end=self._to_datetime(self._row_get(row, 'current_period_end', 7)),
+                        cancel_at_period_end=bool(self._row_get(row, 'cancel_at_period_end', 8)),
+                        cancellation_effective_date=self._to_datetime(self._row_get(row, 'cancellation_effective_date', 9)),
+                        created_at=self._to_datetime(self._row_get(row, 'created_at', 10)),
+                        updated_at=self._to_datetime(self._row_get(row, 'updated_at', 11)),
+                    )
+                )
+            return subs
+        finally:
+            conn.close()
+
+    # Profile photos
+    def upsert_user_profile_photo(
+        self,
+        user_id: int,
+        object_key: str,
+        url: str,
+        storage_backend: str,
+        etag: str = None,
+    ) -> UserProfilePhoto:
+        conn = self.get_connection()
+        cur = conn.cursor()
+
+        try:
+            if self.use_rds:
+                if self.is_postgres:
+                    cur.execute(
+                        """
+                            INSERT INTO user_profile_photos (user_id, object_key, url, storage_backend, etag)
+                            VALUES (%s, %s, %s, %s, %s)
+                            ON CONFLICT (user_id) DO UPDATE SET
+                                object_key = EXCLUDED.object_key,
+                                url = EXCLUDED.url,
+                                storage_backend = EXCLUDED.storage_backend,
+                                etag = EXCLUDED.etag,
+                                last_updated = CURRENT_TIMESTAMP
+                        """,
+                        (user_id, object_key, url, storage_backend, etag),
+                    )
+                else:
+                    cur.execute(
+                        """
+                            INSERT INTO user_profile_photos (user_id, object_key, url, storage_backend, etag)
+                            VALUES (%s, %s, %s, %s, %s)
+                            ON DUPLICATE KEY UPDATE
+                                object_key = VALUES(object_key),
+                                url = VALUES(url),
+                                storage_backend = VALUES(storage_backend),
+                                etag = VALUES(etag),
+                                last_updated = CURRENT_TIMESTAMP
+                        """,
+                        (user_id, object_key, url, storage_backend, etag),
+                    )
+            else:
+                cur.execute(
+                    """
+                        INSERT INTO user_profile_photos (user_id, object_key, url, storage_backend, etag)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(user_id) DO UPDATE SET
+                            object_key = excluded.object_key,
+                            url = excluded.url,
+                            storage_backend = excluded.storage_backend,
+                            etag = excluded.etag,
+                            last_updated = CURRENT_TIMESTAMP
+                    """,
+                    (user_id, object_key, url, storage_backend, etag),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        return self.get_user_profile_photo(user_id)
+
+    def get_user_profile_photo(self, user_id: int) -> Optional[UserProfilePhoto]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        placeholder = self._get_placeholder()
+
+        try:
+            cur.execute(
+                f"SELECT id, user_id, object_key, url, storage_backend, etag, last_updated FROM user_profile_photos WHERE user_id = {placeholder}",
+                (user_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+
+            return UserProfilePhoto(
+                id=self._row_get(row, 'id', 0),
+                user_id=self._row_get(row, 'user_id', 1),
+                object_key=self._row_get(row, 'object_key', 2),
+                url=self._row_get(row, 'url', 3),
+                storage_backend=self._row_get(row, 'storage_backend', 4),
+                etag=self._row_get(row, 'etag', 5),
+                last_updated=self._to_datetime(self._row_get(row, 'last_updated', 6)),
+            )
+        finally:
+            conn.close()
+
+    # Metrics helpers
+    def get_users_created_since(self, since: datetime) -> List[Dict[str, Any]]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        placeholder = self._get_placeholder()
+
+        try:
+            cur.execute(
+                f"SELECT id, created_at FROM userdata WHERE created_at >= {placeholder}",
+                (self._format_datetime(since),),
+            )
+            rows = cur.fetchall()
+            return [
+                {
+                    'id': self._row_get(row, 'id', 0),
+                    'created_at': self._to_datetime(self._row_get(row, 'created_at', 1)),
+                }
+                for row in rows
+            ]
+        finally:
+            conn.close()
+
+    def get_projects_created_since(self, since: datetime) -> List[Dict[str, Any]]:
+        conn = self.get_connection()
+        cur = conn.cursor()
+        placeholder = self._get_placeholder()
+
+        try:
+            cur.execute(
+                f"SELECT id, project_id, created_at FROM projects WHERE created_at >= {placeholder}",
+                (self._format_datetime(since),),
+            )
+            rows = cur.fetchall()
+            return [
+                {
+                    'id': self._row_get(row, 'id', 0),
+                    'project_id': self._row_get(row, 'project_id', 1),
+                    'created_at': self._to_datetime(self._row_get(row, 'created_at', 2)),
+                }
+                for row in rows
+            ]
+        finally:
+            conn.close()
+
+    def count_active_subscriptions(self) -> int:
+        conn = self.get_connection()
+        cur = conn.cursor()
+
+        try:
+            cur.execute(
+                "SELECT COUNT(*) FROM user_subscriptions WHERE status IN ('active', 'trialing')"
+            )
+            row = cur.fetchone()
+            if isinstance(row, dict):
+                return list(row.values())[0]
+            return row[0] if row else 0
+        finally:
+            conn.close()
+
+    def count_total_users(self) -> int:
+        conn = self.get_connection()
+        cur = conn.cursor()
+
+        try:
+            cur.execute("SELECT COUNT(*) FROM userdata")
+            row = cur.fetchone()
+            if isinstance(row, dict):
+                return list(row.values())[0]
+            return row[0] if row else 0
+        finally:
+            conn.close()
+
+    def count_total_projects(self) -> int:
+        conn = self.get_connection()
+        cur = conn.cursor()
+
+        try:
+            cur.execute("SELECT COUNT(*) FROM projects")
+            row = cur.fetchone()
+            if isinstance(row, dict):
+                return list(row.values())[0]
+            return row[0] if row else 0
+        finally:
+            conn.close()
+
     def update_project_details(self, project_id: str, name: str = None, description: str = None):
         """Update project details"""
         conn = self.get_connection()
@@ -2462,10 +3508,10 @@ class DatabaseManager:
         placeholder = self._get_placeholder()
         
         try:
-            if self.is_postgres:
+            if self.use_rds and self.is_postgres:
                 # Use new schema with file_id
                 cur.execute(f"""
-                    SELECT d.id, d.doc_id, d.filename, d.file_id, d.pages, d.chunks_indexed, d.status, d.user_id, d.created_at, d.updated_at 
+                    SELECT d.id, d.doc_id, d.filename, d.file_id, d.pages, d.chunks_indexed, d.status, d.user_id, d.created_at, d.updated_at
                     FROM documents d
                     INNER JOIN project_documents pd ON d.doc_id = pd.doc_id
                     WHERE pd.project_id = {placeholder}

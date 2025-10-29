@@ -3,12 +3,17 @@ Project management API endpoints for the Floor Plan Agent API
 """
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from typing import Optional, List
+from pydantic import BaseModel
 from modules.projects.service import project_service
 from modules.agent.workflow import agent_workflow
 from modules.database import db_manager
 from modules.session import session_manager, context_resolver
 
 router = APIRouter(prefix="/projects", tags=["projects"])
+
+class ShareDecisionRequest(BaseModel):
+    user_id: int
+
 
 @router.post("/create")
 async def create_project(
@@ -159,7 +164,39 @@ async def get_user_projects(user_id: int):
     try:
         projects = project_service.get_user_projects(user_id)
         return {"user_id": user_id, "projects": projects}
-        
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/shared")
+async def get_shared_projects(user_id: int):
+    """Get projects shared with the authenticated user"""
+    try:
+        shared = project_service.get_shared_projects(user_id)
+        return {"user_id": user_id, "shared_projects": shared}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{project_id}/share/accept")
+async def accept_project_share(project_id: str, payload: ShareDecisionRequest):
+    """Accept a project share invitation"""
+    try:
+        return project_service.accept_project_share(project_id, payload.user_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{project_id}/share/reject")
+async def reject_project_share(project_id: str, payload: ShareDecisionRequest):
+    """Reject a project share invitation"""
+    try:
+        return project_service.reject_project_share(project_id, payload.user_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

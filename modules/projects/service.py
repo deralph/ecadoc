@@ -2,15 +2,16 @@
 Project management service for the Floor Plan Agent API
 """
 import uuid
+from dataclasses import asdict
 from typing import List, Optional, Dict, Any
 from modules.database.models import db_manager, Project
 from modules.pdf_processing.service import pdf_processor
 
 class ProjectService:
     """Project management service"""
-    
-    def __init__(self):
-        self.db = db_manager
+
+    def __init__(self, db_manager_instance=None):
+        self.db = db_manager_instance or db_manager
     
     def create_project_with_pdf(self, name: str, description: str, user_id: int, 
                                file_content: bytes, filename: str) -> Dict[str, Any]:
@@ -259,8 +260,46 @@ class ProjectService:
     
     def validate_project_access(self, project_id: str, user_id: int) -> bool:
         """Check if a user has access to a project"""
-        project = self.db.get_project_by_id(project_id)
-        return project is not None and project.user_id == user_id
+        return self.db.user_has_project_access(project_id, user_id)
+
+    def get_shared_projects(self, user_id: int) -> List[Dict[str, Any]]:
+        """Return projects shared with the user"""
+        return self.db.list_shared_projects_for_user(user_id)
+
+    def accept_project_share(self, project_id: str, user_id: int) -> Dict[str, Any]:
+        """Accept a project share invitation"""
+        share = self.db.get_project_share(project_id, user_id)
+        if not share:
+            raise ValueError("Invitation not found")
+        if share.status == 'accepted':
+            return {
+                "status": "accepted",
+                "project": self.get_project(project_id),
+                "share": asdict(share),
+            }
+        if share.status == 'rejected':
+            raise ValueError("Invitation already rejected")
+
+        updated = self.db.update_project_share_status(project_id, user_id, 'accepted')
+        project = self.get_project(project_id)
+        return {
+            "status": updated.status,
+            "project": project,
+            "share": asdict(updated),
+        }
+
+    def reject_project_share(self, project_id: str, user_id: int) -> Dict[str, Any]:
+        share = self.db.get_project_share(project_id, user_id)
+        if not share:
+            raise ValueError("Invitation not found")
+        if share.status == 'rejected':
+            return {"status": "rejected", "share": asdict(share)}
+
+        updated = self.db.update_project_share_status(project_id, user_id, 'rejected')
+        return {
+            "status": updated.status,
+            "share": asdict(updated),
+        }
     
     def delete_project(self, project_id: str, user_id: int = None, delete_shared_documents: bool = True) -> Dict[str, Any]:
         """Delete a project and its associated documents

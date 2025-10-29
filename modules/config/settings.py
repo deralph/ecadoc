@@ -33,7 +33,23 @@ class Settings:
     VERIFICATION_TOKEN_EXPIRE_HOURS = int(os.getenv('VERIFICATION_TOKEN_EXPIRE_HOURS', 1))
     OTP_EXPIRE_MINUTES = int(os.getenv('OTP_EXPIRE_MINUTES', 5))
     FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:3000')
-    
+
+    # Stripe configuration
+    STRIPE_API_KEY = os.getenv('STRIPE_API_KEY')
+    STRIPE_WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET')
+    STRIPE_PRICE_6M = os.getenv('STRIPE_PRICE_6M')
+    STRIPE_PRICE_12M = os.getenv('STRIPE_PRICE_12M')
+    STRIPE_BILLING_PORTAL = os.getenv('STRIPE_BILLING_PORTAL')
+
+    # Profile storage configuration
+    PROFILE_STORAGE_BACKEND = os.getenv('PROFILE_STORAGE_BACKEND', 's3')
+    AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
+    AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
+    AWS_DEFAULT_REGION = os.getenv('AWS_DEFAULT_REGION')
+    AWS_S3_BUCKET = os.getenv('AWS_S3_BUCKET')
+    PROFILE_CDN_BASE_URL = os.getenv('PROFILE_CDN_BASE_URL')
+    PROFILE_S3_FOLDER = os.getenv('PROFILE_S3_FOLDER', 'profile-avatars')
+
     # LangSmith Configuration
     LANGSMITH_TRACING = os.getenv('LANGSMITH_TRACING', 'false').lower() == 'true'
     LANGSMITH_ENDPOINT = os.getenv('LANGSMITH_ENDPOINT')
