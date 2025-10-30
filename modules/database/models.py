@@ -2627,7 +2627,20 @@ class DatabaseManager:
         conn = self.get_connection()
         cur = conn.cursor()
 
-        params = (
+        columns = [
+            "user_id",
+            "plan_code",
+            "stripe_subscription_id",
+            "stripe_customer_id",
+            "status",
+            "current_period_start",
+            "current_period_end",
+            "cancel_at_period_end",
+            "cancellation_effective_date",
+        ]
+
+        cancel_value = cancel_at_period_end if self.use_rds else int(cancel_at_period_end)
+        values: List[Any] = [
             user_id,
             plan_code,
             stripe_subscription_id,
@@ -2635,78 +2648,90 @@ class DatabaseManager:
             status,
             self._format_datetime(current_period_start),
             self._format_datetime(current_period_end),
-            cancel_at_period_end,
+            cancel_value,
             self._format_datetime(cancellation_effective_date),
-        )
+        ]
+
+        include_plan_id = False
+        plan_id_value: Optional[int] = None
+
+        try:
+            table_columns = self._get_table_columns(cur, "user_subscriptions")
+        except Exception:
+            table_columns = set()
+
+        if "plan_id" in table_columns:
+            include_plan_id = True
+            placeholder = "%s" if self.use_rds else "?"
+            cur.execute(
+                f"SELECT id FROM subscription_plans WHERE plan_code = {placeholder}",
+                (plan_code,),
+            )
+            row = cur.fetchone()
+            plan_id_value = row[0] if row else None
+
+            if plan_id_value is None:
+                plan = self.get_subscription_plan(plan_code)
+                plan_id_value = plan.id if plan else None
+
+            if plan_id_value is None:
+                raise ValueError(f"Subscription plan '{plan_code}' is not defined")
+
+            columns.insert(1, "plan_id")
+            values.insert(1, plan_id_value)
+
+        placeholder_symbol = "%s" if self.use_rds else "?"
+        placeholders = ", ".join([placeholder_symbol] * len(columns))
 
         try:
             if self.use_rds:
                 if self.is_postgres:
+                    update_assignments = [
+                        f"{column} = EXCLUDED.{column}"
+                        for column in columns
+                        if column != "user_id"
+                    ]
                     cur.execute(
-                        """
-                            INSERT INTO user_subscriptions (user_id, plan_code, stripe_subscription_id, stripe_customer_id, status,
-                                current_period_start, current_period_end, cancel_at_period_end, cancellation_effective_date)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        f"""
+                            INSERT INTO user_subscriptions ({', '.join(columns)})
+                            VALUES ({placeholders})
                             ON CONFLICT (user_id) DO UPDATE SET
-                                plan_code = EXCLUDED.plan_code,
-                                stripe_subscription_id = EXCLUDED.stripe_subscription_id,
-                                stripe_customer_id = EXCLUDED.stripe_customer_id,
-                                status = EXCLUDED.status,
-                                current_period_start = EXCLUDED.current_period_start,
-                                current_period_end = EXCLUDED.current_period_end,
-                                cancel_at_period_end = EXCLUDED.cancel_at_period_end,
-                                cancellation_effective_date = EXCLUDED.cancellation_effective_date,
+                                {', '.join(update_assignments)},
                                 updated_at = CURRENT_TIMESTAMP
                         """,
-                        params,
+                        tuple(values),
                     )
                 else:
+                    update_assignments = [
+                        f"{column} = VALUES({column})"
+                        for column in columns
+                        if column != "user_id"
+                    ]
                     cur.execute(
-                        """
-                            INSERT INTO user_subscriptions (user_id, plan_code, stripe_subscription_id, stripe_customer_id, status,
-                                current_period_start, current_period_end, cancel_at_period_end, cancellation_effective_date)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        f"""
+                            INSERT INTO user_subscriptions ({', '.join(columns)})
+                            VALUES ({placeholders})
                             ON DUPLICATE KEY UPDATE
-                                plan_code = VALUES(plan_code),
-                                stripe_subscription_id = VALUES(stripe_subscription_id),
-                                stripe_customer_id = VALUES(stripe_customer_id),
-                                status = VALUES(status),
-                                current_period_start = VALUES(current_period_start),
-                                current_period_end = VALUES(current_period_end),
-                                cancel_at_period_end = VALUES(cancel_at_period_end),
-                                cancellation_effective_date = VALUES(cancellation_effective_date),
+                                {', '.join(update_assignments)},
                                 updated_at = CURRENT_TIMESTAMP
                         """,
-                        params,
+                        tuple(values),
                     )
             else:
+                update_assignments = [
+                    f"{column} = excluded.{column}"
+                    for column in columns
+                    if column != "user_id"
+                ]
                 cur.execute(
-                    """
-                        INSERT INTO user_subscriptions (user_id, plan_code, stripe_subscription_id, stripe_customer_id, status,
-                            current_period_start, current_period_end, cancel_at_period_end, cancellation_effective_date)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    f"""
+                        INSERT INTO user_subscriptions ({', '.join(columns)})
+                        VALUES ({placeholders})
                         ON CONFLICT(user_id) DO UPDATE SET
-                            plan_code = excluded.plan_code,
-                            stripe_subscription_id = excluded.stripe_subscription_id,
-                            stripe_customer_id = excluded.stripe_customer_id,
-                            status = excluded.status,
-                            current_period_start = excluded.current_period_start,
-                            current_period_end = excluded.current_period_end,
-                            cancel_at_period_end = excluded.cancel_at_period_end,
-                            cancellation_effective_date = excluded.cancellation_effective_date,
+                            {', '.join(update_assignments)},
                             updated_at = CURRENT_TIMESTAMP
                     """,
-                    (
-                        user_id,
-                        plan_code,
-                        stripe_subscription_id,
-                        stripe_customer_id,
-                        status,
-                        self._format_datetime(current_period_start),
-                        self._format_datetime(current_period_end),
-                        int(cancel_at_period_end),
-                        self._format_datetime(cancellation_effective_date),
-                    ),
+                    tuple(values),
                 )
             conn.commit()
         finally:
