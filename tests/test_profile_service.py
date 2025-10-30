@@ -1,4 +1,5 @@
 import os
+import uuid
 
 from modules.config import settings
 from modules.database.models import DatabaseManager
@@ -12,7 +13,8 @@ def test_profile_avatar_local_storage(tmp_path):
 
     db = DatabaseManager(db_name=str(tmp_path / "profile.db"))
     service = ProfileService(db=db)
-    user_id = db.create_user("Pic", "User", "pic@example.com", "password123")
+    email = f"pic+{uuid.uuid4().hex}@example.com"
+    user_id = db.create_user("Pic", "User", email, "password123")
 
     payload = service.save_avatar(user_id, "avatar.png", "image/png", b"binary-data")
     assert payload["url"].startswith("/download?path=")

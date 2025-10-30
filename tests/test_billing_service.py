@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import uuid
 
 import pytest
 
@@ -48,7 +49,8 @@ def create_billing_service(tmp_path_factory):
     mock_stripe = MockStripe()
     service = BillingService(db=db, stripe_client=mock_stripe)
     db.upsert_subscription_plan("plan_semiannual", "Semi Annual", 6, 6000, "price_semiannual")
-    user_id = db.create_user("Bill", "User", "bill@example.com", "password123")
+    email = f"bill+{uuid.uuid4().hex}@example.com"
+    user_id = db.create_user("Bill", "User", email, "password123")
     return service, mock_stripe, db, user_id
 
 

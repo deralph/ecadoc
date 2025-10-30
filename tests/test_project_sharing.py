@@ -1,3 +1,5 @@
+import uuid
+
 import pytest
 
 from modules.database.models import DatabaseManager
@@ -9,8 +11,10 @@ def project_service(tmp_path_factory):
     db_path = tmp_path_factory.mktemp("db") / "projects.db"
     db = DatabaseManager(db_name=str(db_path))
     service = ProjectService(db)
-    owner_id = db.create_user("Owner", "User", "owner@example.com", "password123")
-    invitee_id = db.create_user("Guest", "User", "guest@example.com", "password123")
+    owner_email = f"owner+{uuid.uuid4().hex}@example.com"
+    guest_email = f"guest+{uuid.uuid4().hex}@example.com"
+    owner_id = db.create_user("Owner", "User", owner_email, "password123")
+    invitee_id = db.create_user("Guest", "User", guest_email, "password123")
     project = service.create_project_without_pdfs("Shared", "Test project", owner_id)
     db.create_or_update_project_share(project["project_id"], owner_id, invitee_id)
     return service, db, project["project_id"], owner_id, invitee_id
