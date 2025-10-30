@@ -2,6 +2,7 @@
 Database models and operations for the Floor Plan Agent API
 """
 import os
+import re
 import sqlite3
 import mysql.connector
 from mysql.connector import Error as MySQLError
@@ -11,6 +12,7 @@ from psycopg2.extras import RealDictCursor
 import hashlib
 import json
 import uuid
+from decimal import Decimal
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -2840,8 +2842,665 @@ class DatabaseManager:
         finally:
             conn.close()
 
+    def ensure_subscription_schema(self):
+        """Ensure subscription plan and user subscription tables match the normalized schema."""
+        conn = self.get_connection()
+        cur = conn.cursor()
+
+        try:
+            plan_mapping = self._ensure_subscription_plans_schema(cur)
+            self._ensure_user_subscriptions_schema(cur, plan_mapping)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _ensure_subscription_plans_schema(self, cur) -> Dict[str, str]:
+        """Guarantee subscription_plans has normalized columns and return plan mapping for migrations."""
+        mapping: Dict[str, str] = {}
+
+        if not self._table_exists(cur, 'subscription_plans'):
+            self._create_subscription_plans_table(cur)
+
+        columns = self._get_table_columns(cur, 'subscription_plans')
+
+        def add_column(column: str, definitions: Dict[str, str]):
+            if column in columns:
+                return
+
+            if self.use_rds:
+                if self.is_postgres:
+                    cur.execute(
+                        f"ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS {column} {definitions['postgres']}"
+                    )
+                else:
+                    cur.execute(
+                        f"ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS {column} {definitions.get('mysql', definitions['postgres'])}"
+                    )
+            else:
+                cur.execute(
+                    f"ALTER TABLE subscription_plans ADD COLUMN {column} {definitions.get('sqlite', definitions['postgres'])}"
+                )
+
+            columns.add(column)
+
+        def drop_column(column: str):
+            if column not in columns:
+                return
+            if not self.use_rds:
+                return
+
+            statement = f"ALTER TABLE subscription_plans DROP COLUMN IF EXISTS {column}"
+            cur.execute(statement)
+            columns.discard(column)
+
+        add_column(
+            'plan_code',
+            {
+                'postgres': 'VARCHAR(50)',
+                'mysql': 'VARCHAR(50)',
+                'sqlite': 'TEXT',
+            },
+        )
+        add_column(
+            'name',
+            {
+                'postgres': 'VARCHAR(255)',
+                'mysql': 'VARCHAR(255)',
+                'sqlite': 'TEXT',
+            },
+        )
+        add_column(
+            'interval_months',
+            {
+                'postgres': 'INTEGER DEFAULT 12',
+                'mysql': 'INT DEFAULT 12',
+                'sqlite': 'INTEGER DEFAULT 12',
+            },
+        )
+        add_column(
+            'amount_cents',
+            {
+                'postgres': 'INTEGER DEFAULT 0',
+                'mysql': 'INT DEFAULT 0',
+                'sqlite': 'INTEGER DEFAULT 0',
+            },
+        )
+        add_column(
+            'stripe_price_id',
+            {
+                'postgres': 'VARCHAR(255)',
+                'mysql': 'VARCHAR(255)',
+                'sqlite': 'TEXT',
+            },
+        )
+        add_column(
+            'is_active',
+            {
+                'postgres': 'BOOLEAN DEFAULT TRUE',
+                'mysql': 'TINYINT(1) DEFAULT 1',
+                'sqlite': 'BOOLEAN DEFAULT 1',
+            },
+        )
+        add_column(
+            'created_at',
+            {
+                'postgres': 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+                'mysql': 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+                'sqlite': 'DATETIME DEFAULT CURRENT_TIMESTAMP',
+            },
+        )
+        add_column(
+            'updated_at',
+            {
+                'postgres': 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+                'mysql': 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+                'sqlite': 'DATETIME DEFAULT CURRENT_TIMESTAMP',
+            },
+        )
+
+        drop_column('price_monthly')
+        drop_column('price_quarterly')
+
+        # Populate missing values and build mapping
+        cur.execute('SELECT * FROM subscription_plans')
+        rows = cur.fetchall()
+        column_names = [desc[0] for desc in cur.description] if cur.description else []
+        plan_rows: List[Dict[str, Any]] = [dict(zip(column_names, row)) for row in rows]
+
+        existing_codes = {
+            str(row.get('plan_code')).strip()
+            for row in plan_rows
+            if row.get('plan_code') and str(row.get('plan_code')).strip()
+        }
+
+        placeholder = '%s' if self.use_rds else '?'
+
+        for index, row in enumerate(plan_rows, start=1):
+            plan_id = row.get('id')
+            original_code = row.get('plan_code')
+            original_name = row.get('name')
+            updates: Dict[str, Any] = {}
+
+            fallback_name = row.get('plan_name') or f"Legacy Plan {plan_id or index}"
+
+            if not original_name:
+                updates['name'] = fallback_name
+            else:
+                fallback_name = original_name
+
+            if not original_code or not str(original_code).strip():
+                base_code = self._slugify_plan_code(fallback_name, f"legacy-plan-{plan_id or index}")
+                candidate = base_code
+                suffix = 1
+                while candidate in existing_codes:
+                    candidate = f"{base_code}-{suffix}"
+                    suffix += 1
+                updates['plan_code'] = candidate
+                existing_codes.add(candidate)
+            else:
+                existing_codes.add(str(original_code).strip())
+
+            interval_value = row.get('interval_months')
+            if not interval_value or (isinstance(interval_value, (int, float)) and interval_value <= 0):
+                interval_fallback = (
+                    row.get('billing_interval_months')
+                    or row.get('duration_months')
+                    or 12
+                )
+                updates['interval_months'] = int(interval_fallback)
+
+            amount_value = row.get('amount_cents')
+            if amount_value in (None, '', 0, 0.0):
+                amount_fallback = None
+                for key in ['price_yearly', 'price_annual', 'price_year', 'price', 'price_monthly', 'price_quarterly']:
+                    if key in row and row.get(key) not in (None, ''):
+                        amount_fallback = row.get(key)
+                        break
+                updates['amount_cents'] = self._normalize_amount_to_cents(amount_fallback)
+
+            if row.get('is_active') is None:
+                updates['is_active'] = True
+
+            if updates:
+                set_clause = ', '.join(f"{column} = {placeholder}" for column in updates.keys())
+                params = list(updates.values()) + [plan_id]
+                cur.execute(
+                    f"UPDATE subscription_plans SET {set_clause} WHERE id = {placeholder}",
+                    params,
+                )
+                row.update(updates)
+
+            final_code = str(row.get('plan_code')).strip() if row.get('plan_code') else None
+            if original_code and final_code and str(original_code).lower() != final_code.lower():
+                mapping[f"code:{str(original_code).lower()}"] = final_code
+
+            self._register_plan_mapping(mapping, row, final_code)
+
+        # Enforce uniqueness on plan_code where possible
+        try:
+            if self.use_rds:
+                if self.is_postgres:
+                    cur.execute(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_subscription_plans_plan_code ON subscription_plans (plan_code)"
+                    )
+                    cur.execute(
+                        "ALTER TABLE subscription_plans ALTER COLUMN plan_code SET NOT NULL"
+                    )
+                else:
+                    try:
+                        cur.execute(
+                            "CREATE UNIQUE INDEX idx_subscription_plans_plan_code ON subscription_plans (plan_code)"
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        cur.execute(
+                            "ALTER TABLE subscription_plans MODIFY plan_code VARCHAR(50) NOT NULL"
+                        )
+                    except Exception:
+                        pass
+            else:
+                cur.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_subscription_plans_plan_code ON subscription_plans (plan_code)"
+                )
+        except Exception:
+            # Index/constraint creation should not block startup if it already exists or fails for legacy engines
+            pass
+
+        # Attempt to remove legacy plan_name column after copying
+        if 'plan_name' in columns and self.use_rds:
+            try:
+                cur.execute('ALTER TABLE subscription_plans DROP COLUMN IF EXISTS plan_name')
+            except Exception:
+                pass
+
+        return mapping
+
+    def _ensure_user_subscriptions_schema(self, cur, plan_mapping: Dict[str, str]):
+        if not self._table_exists(cur, 'user_subscriptions'):
+            self._create_user_subscriptions_table(cur)
+            return
+
+        columns = self._get_table_columns(cur, 'user_subscriptions')
+
+        def add_column(column: str, definitions: Dict[str, str]):
+            if column in columns:
+                return
+            if self.use_rds:
+                if self.is_postgres:
+                    cur.execute(
+                        f"ALTER TABLE user_subscriptions ADD COLUMN IF NOT EXISTS {column} {definitions['postgres']}"
+                    )
+                else:
+                    cur.execute(
+                        f"ALTER TABLE user_subscriptions ADD COLUMN IF NOT EXISTS {column} {definitions.get('mysql', definitions['postgres'])}"
+                    )
+            else:
+                cur.execute(
+                    f"ALTER TABLE user_subscriptions ADD COLUMN {column} {definitions.get('sqlite', definitions['postgres'])}"
+                )
+            columns.add(column)
+
+        add_column(
+            'plan_code',
+            {
+                'postgres': 'VARCHAR(50)',
+                'mysql': 'VARCHAR(50)',
+                'sqlite': 'TEXT',
+            },
+        )
+        add_column(
+            'stripe_subscription_id',
+            {
+                'postgres': 'VARCHAR(255)',
+                'mysql': 'VARCHAR(255)',
+                'sqlite': 'TEXT',
+            },
+        )
+        add_column(
+            'stripe_customer_id',
+            {
+                'postgres': 'VARCHAR(255)',
+                'mysql': 'VARCHAR(255)',
+                'sqlite': 'TEXT',
+            },
+        )
+        add_column(
+            'status',
+            {
+                'postgres': "VARCHAR(30) DEFAULT 'inactive'",
+                'mysql': "VARCHAR(30) DEFAULT 'inactive'",
+                'sqlite': "TEXT DEFAULT 'inactive'",
+            },
+        )
+        add_column(
+            'current_period_start',
+            {
+                'postgres': 'TIMESTAMP NULL',
+                'mysql': 'DATETIME NULL',
+                'sqlite': 'DATETIME NULL',
+            },
+        )
+        add_column(
+            'current_period_end',
+            {
+                'postgres': 'TIMESTAMP NULL',
+                'mysql': 'DATETIME NULL',
+                'sqlite': 'DATETIME NULL',
+            },
+        )
+        add_column(
+            'cancel_at_period_end',
+            {
+                'postgres': 'BOOLEAN DEFAULT FALSE',
+                'mysql': 'TINYINT(1) DEFAULT 0',
+                'sqlite': 'BOOLEAN DEFAULT 0',
+            },
+        )
+        add_column(
+            'cancellation_effective_date',
+            {
+                'postgres': 'TIMESTAMP NULL',
+                'mysql': 'DATETIME NULL',
+                'sqlite': 'DATETIME NULL',
+            },
+        )
+        add_column(
+            'created_at',
+            {
+                'postgres': 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+                'mysql': 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+                'sqlite': 'DATETIME DEFAULT CURRENT_TIMESTAMP',
+            },
+        )
+        add_column(
+            'updated_at',
+            {
+                'postgres': 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+                'mysql': 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP',
+                'sqlite': 'DATETIME DEFAULT CURRENT_TIMESTAMP',
+            },
+        )
+
+        # Update legacy rows with plan codes and defaults
+        cur.execute('SELECT * FROM user_subscriptions')
+        rows = cur.fetchall()
+        column_names = [desc[0] for desc in cur.description] if cur.description else []
+        subscription_rows: List[Dict[str, Any]] = [dict(zip(column_names, row)) for row in rows]
+
+        placeholder = '%s' if self.use_rds else '?'
+
+        for index, row in enumerate(subscription_rows, start=1):
+            sub_id = row.get('id')
+            updates: Dict[str, Any] = {}
+            resolved_plan_code = self._resolve_plan_code_for_subscription(
+                row,
+                plan_mapping,
+                fallback=f"legacy-plan-{row.get('plan_id') or sub_id or index}",
+            )
+
+            if resolved_plan_code and row.get('plan_code') != resolved_plan_code:
+                updates['plan_code'] = resolved_plan_code
+
+            if not row.get('status'):
+                updates['status'] = 'inactive'
+
+            if row.get('cancel_at_period_end') is None:
+                updates['cancel_at_period_end'] = False
+
+            if updates:
+                set_clause = ', '.join(f"{column} = {placeholder}" for column in updates.keys())
+                params = list(updates.values()) + [sub_id]
+                cur.execute(
+                    f"UPDATE user_subscriptions SET {set_clause} WHERE id = {placeholder}",
+                    params,
+                )
+
+        # Ensure unique constraint/index on user_id to prevent duplicates
+        try:
+            if self.use_rds:
+                if self.is_postgres:
+                    cur.execute(
+                        """
+                        DO $$
+                        BEGIN
+                            IF NOT EXISTS (
+                                SELECT 1 FROM pg_constraint
+                                WHERE conrelid = 'user_subscriptions'::regclass
+                                AND conname = 'user_subscriptions_user_id_key'
+                            ) THEN
+                                ALTER TABLE user_subscriptions ADD CONSTRAINT user_subscriptions_user_id_key UNIQUE (user_id);
+                            END IF;
+                        END $$;
+                        """
+                    )
+                else:
+                    try:
+                        cur.execute(
+                            "ALTER TABLE user_subscriptions ADD UNIQUE INDEX idx_user_subscriptions_user_id (user_id)"
+                        )
+                    except Exception:
+                        pass
+            else:
+                cur.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_user_subscriptions_user_id ON user_subscriptions (user_id)"
+                )
+        except Exception:
+            pass
+
+    def _table_exists(self, cur, table_name: str) -> bool:
+        try:
+            if self.use_rds:
+                if self.is_postgres:
+                    cur.execute(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM information_schema.tables
+                            WHERE table_schema = 'public'
+                            AND table_name = %s
+                        )
+                        """,
+                        (table_name,),
+                    )
+                    result = cur.fetchone()
+                    return bool(result[0]) if result else False
+                else:
+                    cur.execute("SHOW TABLES LIKE %s", (table_name,))
+                    return cur.fetchone() is not None
+            else:
+                cur.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                    (table_name,),
+                )
+                return cur.fetchone() is not None
+        except Exception:
+            return False
+
+    def _get_table_columns(self, cur, table_name: str) -> set:
+        if not self._table_exists(cur, table_name):
+            return set()
+
+        if self.use_rds:
+            if self.is_postgres:
+                cur.execute(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                    AND table_name = %s
+                    """,
+                    (table_name,),
+                )
+                return {row[0] for row in cur.fetchall()}
+            else:
+                cur.execute(f"SHOW COLUMNS FROM `{table_name}`")
+                return {row[0] for row in cur.fetchall()}
+        else:
+            cur.execute(f"PRAGMA table_info({table_name})")
+            return {row[1] for row in cur.fetchall()}
+
+    def _create_subscription_plans_table(self, cur):
+        if self.use_rds:
+            if self.is_postgres:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS subscription_plans (
+                        id SERIAL PRIMARY KEY,
+                        plan_code VARCHAR(50) UNIQUE NOT NULL,
+                        name VARCHAR(255) NOT NULL,
+                        interval_months INTEGER NOT NULL,
+                        amount_cents INTEGER NOT NULL,
+                        stripe_price_id VARCHAR(255),
+                        is_active BOOLEAN DEFAULT TRUE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+            else:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS subscription_plans (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        plan_code VARCHAR(50) NOT NULL UNIQUE,
+                        name VARCHAR(255) NOT NULL,
+                        interval_months INT NOT NULL,
+                        amount_cents INT NOT NULL,
+                        stripe_price_id VARCHAR(255),
+                        is_active BOOLEAN DEFAULT TRUE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                    ) ENGINE=InnoDB CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                    """
+                )
+        else:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS subscription_plans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    plan_code TEXT UNIQUE NOT NULL,
+                    name TEXT NOT NULL,
+                    interval_months INTEGER NOT NULL,
+                    amount_cents INTEGER NOT NULL,
+                    stripe_price_id TEXT,
+                    is_active BOOLEAN DEFAULT 1,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+
+    def _create_user_subscriptions_table(self, cur):
+        if self.use_rds:
+            if self.is_postgres:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS user_subscriptions (
+                        id SERIAL PRIMARY KEY,
+                        user_id INTEGER NOT NULL UNIQUE,
+                        plan_code VARCHAR(50) NOT NULL,
+                        stripe_subscription_id VARCHAR(255),
+                        stripe_customer_id VARCHAR(255),
+                        status VARCHAR(30) NOT NULL DEFAULT 'inactive',
+                        current_period_start TIMESTAMP NULL,
+                        current_period_end TIMESTAMP NULL,
+                        cancel_at_period_end BOOLEAN DEFAULT FALSE,
+                        cancellation_effective_date TIMESTAMP NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (plan_code) REFERENCES subscription_plans (plan_code),
+                        FOREIGN KEY (user_id) REFERENCES userdata (id) ON DELETE CASCADE
+                    )
+                    """
+                )
+            else:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS user_subscriptions (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        user_id INT NOT NULL UNIQUE,
+                        plan_code VARCHAR(50) NOT NULL,
+                        stripe_subscription_id VARCHAR(255),
+                        stripe_customer_id VARCHAR(255),
+                        status VARCHAR(30) NOT NULL DEFAULT 'inactive',
+                        current_period_start DATETIME NULL,
+                        current_period_end DATETIME NULL,
+                        cancel_at_period_end BOOLEAN DEFAULT FALSE,
+                        cancellation_effective_date DATETIME NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        FOREIGN KEY (plan_code) REFERENCES subscription_plans (plan_code),
+                        FOREIGN KEY (user_id) REFERENCES userdata (id) ON DELETE CASCADE
+                    ) ENGINE=InnoDB CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                    """
+                )
+        else:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_subscriptions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL UNIQUE,
+                    plan_code TEXT NOT NULL,
+                    stripe_subscription_id TEXT,
+                    stripe_customer_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'inactive',
+                    current_period_start DATETIME,
+                    current_period_end DATETIME,
+                    cancel_at_period_end BOOLEAN DEFAULT 0,
+                    cancellation_effective_date DATETIME,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (plan_code) REFERENCES subscription_plans (plan_code),
+                    FOREIGN KEY (user_id) REFERENCES userdata (id) ON DELETE CASCADE
+                )
+                """
+            )
+
+    def _slugify_plan_code(self, value: str, fallback: str) -> str:
+        base = ''
+        if value:
+            base = re.sub(r'[^a-z0-9]+', '-', value.lower()).strip('-')
+        if not base:
+            base = re.sub(r'[^a-z0-9]+', '-', fallback.lower()).strip('-') or 'legacy-plan'
+        return base.replace('-', '_')
+
+    def _normalize_amount_to_cents(self, value: Any) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, Decimal):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(round(value))
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            try:
+                value = bytes(value).decode()
+            except Exception:
+                return 0
+        if isinstance(value, str):
+            cleaned = value.strip().replace(',', '')
+            if not cleaned:
+                return 0
+            try:
+                return int(round(float(cleaned)))
+            except ValueError:
+                digits = ''.join(re.findall(r'\d+', cleaned))
+                return int(digits) if digits else 0
+        return 0
+
+    def _register_plan_mapping(self, mapping: Dict[str, str], row: Dict[str, Any], plan_code: Optional[str]):
+        if not plan_code:
+            return
+
+        mapping[f"code:{plan_code.lower()}"] = plan_code
+
+        original_code = row.get('plan_code')
+        if original_code:
+            mapping[f"code:{str(original_code).lower()}"] = plan_code
+
+        plan_id = row.get('id')
+        if plan_id is not None:
+            mapping[f"id:{plan_id}"] = plan_code
+
+        for key in ('plan_name', 'name'):
+            if row.get(key):
+                mapping[f"name:{str(row.get(key)).lower()}"] = plan_code
+
+    def _resolve_plan_code_for_subscription(self, row: Dict[str, Any], mapping: Dict[str, str], fallback: str) -> str:
+        if not mapping:
+            return row.get('plan_code') or fallback
+
+        candidates = []
+
+        if row.get('plan_code'):
+            candidates.append(f"code:{str(row['plan_code']).lower()}")
+
+        if 'plan_id' in row and row.get('plan_id') is not None:
+            candidates.append(f"id:{row['plan_id']}")
+
+        if 'plan_name' in row and row.get('plan_name'):
+            candidates.append(f"name:{str(row['plan_name']).lower()}")
+
+        if 'name' in row and row.get('name'):
+            candidates.append(f"name:{str(row['name']).lower()}")
+
+        for candidate in candidates:
+            if candidate in mapping:
+                return mapping[candidate]
+
+        return row.get('plan_code') or fallback
+
     def ensure_default_subscription_plans(self):
         """Ensure the canonical semi-annual and annual plans exist"""
+        # Normalize schema before attempting to seed plans so legacy databases do not fail.
+        try:
+            self.ensure_subscription_schema()
+        except Exception:
+            # Continue even if normalization fails so existing behaviour is preserved.
+            pass
+
         defaults = [
             (
                 'plan_semiannual',

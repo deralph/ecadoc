@@ -45,6 +45,8 @@ def drop_legacy_columns():
 def main():
     print("Running subscription pricing migration...")
     drop_legacy_columns()
+    print("Normalizing subscription schema...")
+    db_manager.ensure_subscription_schema()
     db_manager.ensure_default_subscription_plans()
     print("✓ Migration complete. Plans normalized to semi-annual and annual options.")
 
